@@ -166,4 +166,66 @@ describe("WebhookWorker", () => {
     expect(dead.last_error).toBe("500 Internal Server Error");
     expect(dead.url).toBe("https://example.com/webhook");
   });
+
+  describe("dead-letter edge cases", () => {
+    const seedLastAttempt = () => {
+      const db = getDb();
+      const now = Math.floor(Date.now() / 1000);
+      db.prepare(`
+        INSERT INTO webhook_deliveries (stream_id, event, payload, attempt, max_attempts, status, next_retry_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run("s1", "event.created", '{"k":"v"}', 2, 3, "pending", now - 10, now - 10);
+      return db.prepare("SELECT id FROM webhook_deliveries").get() as any;
+    };
+
+    it("last permitted retry failing dead-letters once with the failure reason and does not retry again", async () => {
+      const db = getDb();
+      const { id } = seedLastAttempt();
+      (axios.post as any).mockRejectedValueOnce(new Error("503 Service Unavailable"));
+
+      await processWebhookQueue();
+      // A further poll must not re-send or duplicate anything.
+      await processWebhookQueue();
+
+      expect(axios.post).toHaveBeenCalledTimes(1);
+      expect(db.prepare("SELECT * FROM webhook_deliveries WHERE id = ?").get(id)).toBeUndefined();
+      expect(countDeadLetters()).toBe(1);
+      const dead = db.prepare("SELECT * FROM webhook_dead_letters").get() as any;
+      expect(dead.stream_id).toBe("s1");
+      expect(dead.event).toBe("event.created");
+      expect(dead.payload).toBe('{"k":"v"}');
+      expect(dead.last_error).toBe("503 Service Unavailable");
+    });
+
+    it("worker restart during dead-letter transition leaves no duplicate dead letter", async () => {
+      const db = getDb();
+      const { id } = seedLastAttempt();
+
+      // Simulate a crash after the dead-letter INSERT but before the DELETE completes.
+      db.exec(`
+        CREATE TRIGGER fail_delivery_delete BEFORE DELETE ON webhook_deliveries
+        BEGIN SELECT RAISE(ABORT, 'simulated crash'); END;
+      `);
+      (axios.post as any).mockRejectedValueOnce(new Error("Critical Failure"));
+      await processWebhookQueue();
+
+      // Transition rolled back atomically: delivery intact, nothing dead-lettered.
+      expect(countDeadLetters()).toBe(0);
+      const interrupted = db.prepare("SELECT * FROM webhook_deliveries WHERE id = ?").get(id) as any;
+      expect(interrupted.status).toBe("pending");
+      expect(interrupted.attempt).toBe(2);
+
+      // "Restart": fault removed, worker processes the queue again.
+      db.exec("DROP TRIGGER fail_delivery_delete");
+      (axios.post as any).mockRejectedValueOnce(new Error("Critical Failure"));
+      await processWebhookQueue();
+
+      expect(axios.post).toHaveBeenCalledTimes(2);
+      expect(db.prepare("SELECT * FROM webhook_deliveries WHERE id = ?").get(id)).toBeUndefined();
+      expect(countDeadLetters()).toBe(1);
+      const dead = db.prepare("SELECT * FROM webhook_dead_letters").get() as any;
+      expect(dead.last_error).toBe("Critical Failure");
+      expect(dead.payload).toBe('{"k":"v"}');
+    });
+  });
 });

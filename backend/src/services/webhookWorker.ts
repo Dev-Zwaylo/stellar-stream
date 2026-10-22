@@ -78,14 +78,17 @@ export const processWebhookQueue = async () => {
         const newAttempt = attempt + 1;
         if (newAttempt >= max_attempts) {
           // Move to dead-letter storage
-          db.prepare(
-            `INSERT INTO webhook_dead_letters (stream_id, event, url, payload, last_error, failed_at)
-             VALUES (?, ?, ?, ?, ?, ?)`
-          ).run(delivery.stream_id, event, url, payload, errorMsg, updateNow);
+          // Atomic so a crash mid-transition cannot leave both rows behind.
+          db.transaction(() => {
+            db.prepare(
+              `INSERT INTO webhook_dead_letters (stream_id, event, url, payload, last_error, failed_at)
+               VALUES (?, ?, ?, ?, ?, ?)`
+            ).run(delivery.stream_id, event, url, payload, errorMsg, updateNow);
 
-          db.prepare(
-            `DELETE FROM webhook_deliveries WHERE id = ?`
-          ).run(id);
+            db.prepare(
+              `DELETE FROM webhook_deliveries WHERE id = ?`
+            ).run(id);
+          })();
           logger.error({ deliveryId: id, event, maxAttempts: max_attempts }, "webhook delivery moved to dead-letter storage");
         } else {
           // Use configured retry delays: 5s, 15s, 60s, 300s, 900s
