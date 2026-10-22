@@ -32,7 +32,7 @@ import {
   startIndexer,
   getCircuitBreakerStatus,
 } from "./services/indexer";
-import { adminAuth } from "./middleware/adminAuth";
+import { adminAuth, isValidAdminKey } from "./middleware/adminAuth";
 import { deleteStreamById, reconcileStream } from "./services/streamStore";
 import { getCache } from "./services/cache";
 import { getStreamStats } from "./services/stats";
@@ -541,7 +541,7 @@ app.delete("/api/admin/assets/:code", adminJwtAuth, (req: Request, res: Response
 
 app.post(["/api/admin/auth", "/api/auth/admin"], (req: Request, res: Response) => {
   const apiKey = req.body?.apiKey || req.header("X-Admin-Key");
-  if (!apiKey || apiKey !== process.env.ADMIN_API_KEY) {
+  if (!isValidAdminKey(apiKey)) {
     sendApiError(req, res, 401, "Invalid Admin API Key.", { code: "UNAUTHORIZED" });
     return;
   }
