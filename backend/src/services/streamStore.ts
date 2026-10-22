@@ -417,28 +417,26 @@ async function fetchOnChainStreamRecord(
   return result;
 }
 
-function recordBackfilledCreatedEvent(stream: StreamRecord): void {
+function recordBackfilledCreatedEvent(stream: StreamRecord, dbHandle?: any): void {
   if (streamHasEvent(stream.id, "created")) {
     return;
   }
 
-  const db = getDb();
-  db.transaction(() => {
-    recordEventWithDb(
-      db,
-      stream.id,
-      "created",
-      stream.createdAt,
-      stream.sender,
-      stream.totalAmount,
-      {
-        recipient: stream.recipient,
-        assetCode: stream.assetCode,
-        durationSeconds: stream.durationSeconds,
-        source: "reconciliation",
-      },
-    );
-  })();
+  const db = dbHandle ?? getDb();
+  recordEventWithDb(
+    db,
+    stream.id,
+    "created",
+    stream.createdAt,
+    stream.sender,
+    stream.totalAmount,
+    {
+      recipient: stream.recipient,
+      assetCode: stream.assetCode,
+      durationSeconds: stream.durationSeconds,
+      source: "reconciliation",
+    },
+  );
 }
 
 function computeStatus(stream: StreamRecord, at: number): StreamStatus {
@@ -722,18 +720,26 @@ export async function reconcileStream(streamId: string): Promise<StreamRecord> {
 
   try {
     const sourceAccount = await sorobanContext.sourceAccountPromise;
-    const onChainStream = await fetchOnChainStreamRecord(
-      sorobanContext.contract,
-      sourceAccount,
-      id,
-      true,
+    const onChainStream = await retryWithBackoff(
+      () =>
+        fetchOnChainStreamRecord(
+          sorobanContext.contract,
+          sourceAccount,
+          id,
+          true,
+        ),
+      2,
     );
 
     if (!onChainStream) {
       throw new Error("Stream not found on-chain");
     }
 
-    upsertStream(onChainStream);
+    const db = getDb();
+    db.transaction(() => {
+      upsertStream(onChainStream);
+      recordBackfilledCreatedEvent(onChainStream, db);
+    })();
 
     logger.info({ streamId }, "stream reconciled with on-chain state");
     return onChainStream;
@@ -751,10 +757,16 @@ export async function reconcileMissingStreams(): Promise<number> {
 
   try {
     const sourceAccount = await sorobanContext.sourceAccountPromise;
-    const nextId = await fetchNextOnChainStreamId(
-      sorobanContext.contract,
-      sourceAccount,
-    );
+    let nextId: number | null = null;
+    try {
+      nextId = await retryWithBackoff(
+        () => fetchNextOnChainStreamId(sorobanContext.contract, sourceAccount),
+        2,
+      );
+    } catch (err) {
+      logger.error({ err }, "failed to fetch next on-chain stream ID due to RPC outage");
+      return 0;
+    }
 
     if (nextId === null || nextId <= 1) {
       logger.info("no on-chain streams available to reconcile");
@@ -778,12 +790,18 @@ export async function reconcileMissingStreams(): Promise<number> {
     logger.warn({ missingCount: missingIds.length, missingIds }, "missing local streams detected");
 
     let repairedCount = 0;
+    const db = getDb();
+
     for (const missingId of missingIds) {
       try {
-        const stream = await fetchOnChainStreamRecord(
-          sorobanContext.contract,
-          sourceAccount,
-          missingId,
+        const stream = await retryWithBackoff(
+          () =>
+            fetchOnChainStreamRecord(
+              sorobanContext.contract,
+              sourceAccount,
+              missingId,
+            ),
+          2,
         );
 
         if (!stream) {
@@ -791,11 +809,19 @@ export async function reconcileMissingStreams(): Promise<number> {
           continue;
         }
 
-        upsertStream(stream);
-        recordBackfilledCreatedEvent(stream);
+        // Atomically commit stream and event in a single transaction.
+        // If event recording or upsert fails, the entire stream insertion rolls back cleanly.
+        db.transaction(() => {
+          upsertStream(stream);
+          recordBackfilledCreatedEvent(stream, db);
+        })();
+
         repairedCount += 1;
       } catch (err) {
-        logger.error({ err, streamId: missingId }, "failed to backfill missing stream");
+        logger.error({ err, streamId: missingId }, "failed to backfill missing stream due to RPC outage or error");
+        // On persistent RPC outage, abort remaining missing streams in this cycle to avoid hammering a down RPC provider,
+        // while preserving already committed streams.
+        break;
       }
     }
 
@@ -1381,6 +1407,8 @@ export async function cancelStream(
 export async function pauseStream(id: string): Promise<StreamRecord> {
   const pausedAt = nowInSeconds();
   const { stream } = mutateStreamAndEvent(id, (current) => {
+    // Re-read committed state under the writer lock so a concurrent writer
+    // (e.g. cancel) cannot be overwritten with a stale record.
     const status = computeStatus(current, pausedAt);
     if (status !== "active") {
       throw streamError("Only active streams can be paused.", 400);
@@ -1402,6 +1430,8 @@ export async function pauseStream(id: string): Promise<StreamRecord> {
 export async function resumeStream(id: string): Promise<StreamRecord> {
   const now = nowInSeconds();
   const { stream } = mutateStreamAndEvent(id, (current) => {
+    // Re-read committed state under the writer lock so a concurrent writer
+    // (e.g. cancel) cannot be overwritten with a stale record.
     if (current.pausedAt === undefined) {
       throw streamError("Stream is not paused.", 400);
     }
@@ -1432,6 +1462,8 @@ export async function updateStreamStartAt(id: string,
 ): Promise<StreamRecord> {
   const updatedAt = nowInSeconds();
   const { stream } = mutateStreamAndEvent(id, (current) => {
+    // Re-read committed state under the writer lock so a concurrent writer
+    // (e.g. cancel) cannot be overwritten with a stale record.
     const status = computeStatus(current, updatedAt);
     if (status !== "scheduled") {
       throw streamError(
@@ -1460,6 +1492,8 @@ export async function updateStreamStartAt(id: string,
 
 export function markStreamComplete(id: string, at: number = nowInSeconds()): StreamRecord {
   const { stream } = mutateStreamAndEvent(id, (current) => {
+    // Re-read committed state under the writer lock so a concurrent writer
+    // (e.g. cancel) cannot be overwritten with a stale record.
     const status = computeStatus(current, at);
     if (status === "completed") {
       throw streamError("Stream is already completed.", 400);
@@ -1489,16 +1523,26 @@ export function markStreamComplete(id: string, at: number = nowInSeconds()): Str
 export function deleteStreamById(id: string): boolean {
   const db = getDb();
 
-  const stream = db
-    .prepare("SELECT id, archived_at FROM streams WHERE id = ?")
-    .get(id) as { id: string; archived_at: number | null } | undefined;
-
-  if (!stream) return false;
-
-  if (stream.archived_at !== null) return false;
-
   const now = nowInSeconds();
-  db.prepare("UPDATE streams SET archived_at = ? WHERE id = ?").run(now, id);
+  let deleted = false;
+  try {
+    db.transaction(() => {
+      const stream = db
+        .prepare("SELECT id, archived_at FROM streams WHERE id = ?")
+        .get(id) as { id: string; archived_at: number | null } | undefined;
+
+      if (!stream) return;
+      if (stream.archived_at !== null) return;
+
+      db.prepare("UPDATE streams SET archived_at = ? WHERE id = ?").run(now, id);
+      deleted = true;
+    })();
+  } catch (err) {
+    logger.error({ err, streamId: id }, "stream delete rolled back");
+    return false;
+  }
+
+  if (!deleted) return false;
 
   // SSB-2026-108: keep list results consistent with committed state.
   invalidateCacheSync(`stream:${id}`);
