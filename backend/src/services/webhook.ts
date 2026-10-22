@@ -119,7 +119,7 @@ export function countDeadLetters(): number {
 export function pruneDeadLettersOlderThan(cutoffTimestamp: number): number {
   const db = getDb();
   const result = db
-    .prepare(`DELETE FROM webhook_dead_letters WHERE failed_at < `)
+    .prepare(`DELETE FROM webhook_dead_letters WHERE failed_at < ?`)
     .run(cutoffTimestamp);
   return result.changes;
 }
@@ -188,8 +188,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 }
 
 export function getRetryDelaySeconds(attemptNumber: number): number {
-  if (attemptNumber < 0 || attemptNumber >= RETRIES_DELAYS.length) {
-    return RETRIES_DELAYS[RETRIES_DELAYS.length - 1];
+  if (attemptNumber < 0 || attemptNumber >= RETRY_DELAYS.length) {
+    return RETRY_DELAYS[RETRY_DELAYS.length - 1];
   }
   return RETRY_DELAYS[attemptNumber];
 }
